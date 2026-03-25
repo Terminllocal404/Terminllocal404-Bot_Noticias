@@ -1,4 +1,4 @@
-"""RSS feed ingestion and filtering logic."""
+"""Aggregation engine for RSS ingestion, normalization, and filtering."""
 
 from __future__ import annotations
 
@@ -8,7 +8,8 @@ from typing import Dict, Iterable, List
 
 import feedparser
 
-from config import CATEGORY_KEYWORDS, CRITICAL_KEYWORDS, DEFAULT_KEYWORDS, RSS_FEEDS
+from config import CATEGORY_KEYWORDS, DEFAULT_KEYWORDS, RSS_FEEDS
+from scoring import compute_severity_score
 
 LOGGER = logging.getLogger(__name__)
 
@@ -19,9 +20,10 @@ class NewsItem:
     link: str
     description: str
     source: str
+    category: str
     matched_keywords: List[str]
-    score: int
-    critical: bool
+    severity_score: int
+    severity_level: str
 
 
 def _text_blob(entry: dict) -> str:
@@ -31,72 +33,75 @@ def _text_blob(entry: dict) -> str:
     return f"{title} {summary} {tags}".lower()
 
 
-def _score_item(text: str, category: str | None = None) -> tuple[list[str], int, bool]:
-    matched = [kw for kw in DEFAULT_KEYWORDS if kw in text]
-    score = len(matched)
+def _classify_category(text: str, feed_category: str) -> str:
+    for category, keywords in CATEGORY_KEYWORDS.items():
+        if any(keyword in text for keyword in keywords):
+            return category
+    return "threat" if feed_category == "security" else feed_category
+
+
+def _matches_filter(text: str, category: str | None) -> tuple[bool, list[str]]:
+    matched = [keyword for keyword in DEFAULT_KEYWORDS if keyword in text]
 
     if category and category in CATEGORY_KEYWORDS:
-        for kw in CATEGORY_KEYWORDS[category]:
-            if kw in text and kw not in matched:
-                matched.append(kw)
-                score += 2
+        matched += [k for k in CATEGORY_KEYWORDS[category] if k in text and k not in matched]
 
-    critical = any(kw in text for kw in CRITICAL_KEYWORDS)
-    if critical:
-        score += 4
-    return matched, score, critical
+    return bool(matched), matched
 
 
-def fetch_news(category: str | None = None, limit: int = 10) -> List[NewsItem]:
+def fetch_news(category: str | None = None, limit: int = 15) -> List[NewsItem]:
     items: List[NewsItem] = []
     seen_links: set[str] = set()
 
-    for feed_url in RSS_FEEDS:
-        parsed = feedparser.parse(feed_url)
-        if parsed.bozo:
-            LOGGER.warning("Unable to parse feed %s: %s", feed_url, parsed.bozo_exception)
-            continue
-
-        source = parsed.feed.get("title", feed_url)
-        for entry in parsed.entries:
-            link = entry.get("link", "")
-            if not link or link in seen_links:
+    feed_scope = RSS_FEEDS.keys() if category is None else [category]
+    for feed_category in feed_scope:
+        for feed_url in RSS_FEEDS.get(feed_category, []):
+            parsed = feedparser.parse(feed_url)
+            if parsed.bozo:
+                LOGGER.warning("Unable to parse feed %s: %s", feed_url, parsed.bozo_exception)
                 continue
 
-            text = _text_blob(entry)
-            matched, score, critical = _score_item(text, category)
-            if not matched:
-                continue
-
-            if category and category in CATEGORY_KEYWORDS:
-                if not any(kw in text for kw in CATEGORY_KEYWORDS[category]):
+            source = parsed.feed.get("title", feed_url)
+            for entry in parsed.entries:
+                link = entry.get("link", "")
+                if not link or link in seen_links:
                     continue
 
-            seen_links.add(link)
-            items.append(
-                NewsItem(
-                    title=entry.get("title", "Untitled"),
-                    link=link,
-                    description=entry.get("summary", ""),
-                    source=source,
-                    matched_keywords=matched,
-                    score=score,
-                    critical=critical,
-                )
-            )
+                text = _text_blob(entry)
+                ok, matched = _matches_filter(text, category)
+                if not ok:
+                    continue
 
-    items.sort(key=lambda item: (item.critical, item.score), reverse=True)
+                detected_category = _classify_category(text, feed_category)
+                if category and detected_category != category:
+                    continue
+
+                severity = compute_severity_score(text)
+                seen_links.add(link)
+                items.append(
+                    NewsItem(
+                        title=entry.get("title", "Untitled"),
+                        link=link,
+                        description=entry.get("summary", ""),
+                        source=source,
+                        category=detected_category,
+                        matched_keywords=matched,
+                        severity_score=severity.score,
+                        severity_level=severity.level,
+                    )
+                )
+
+    items.sort(key=lambda item: (item.severity_score, len(item.matched_keywords)), reverse=True)
     return items[:limit]
 
 
 def fetch_critical_alerts(limit: int = 8) -> List[NewsItem]:
-    alerts = [item for item in fetch_news(category="security", limit=50) if item.critical]
-    return alerts[:limit]
+    return [item for item in fetch_news(category=None, limit=60) if item.severity_level in {"HIGH", "CRITICAL"}][:limit]
 
 
 def extract_trend_keywords(items: Iterable[NewsItem]) -> Dict[str, int]:
-    trend_counts: Dict[str, int] = {}
+    trends: Dict[str, int] = {}
     for item in items:
-        for kw in item.matched_keywords:
-            trend_counts[kw] = trend_counts.get(kw, 0) + 1
-    return trend_counts
+        for keyword in item.matched_keywords:
+            trends[keyword] = trends.get(keyword, 0) + 1
+    return trends

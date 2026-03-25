@@ -1,4 +1,4 @@
-"""CVE feed fetcher and basic severity ranking."""
+"""CVE aggregation logic."""
 
 from __future__ import annotations
 
@@ -31,12 +31,12 @@ def _to_float(value: object) -> float:
 def classify_severity(cvss: float, summary: str) -> str:
     text = (summary or "").lower()
     if cvss >= 9.0 or "critical" in text or "actively exploited" in text:
-        return "critical"
-    if cvss >= 7.0:
-        return "high"
+        return "CRITICAL"
+    if cvss >= 7.0 or "rce" in text:
+        return "HIGH"
     if cvss >= 4.0:
-        return "medium"
-    return "low"
+        return "MEDIUM"
+    return "LOW"
 
 
 def fetch_latest_cves(limit: int = 10) -> List[CVEItem]:
@@ -51,10 +51,10 @@ def fetch_latest_cves(limit: int = 10) -> List[CVEItem]:
     cves: List[CVEItem] = []
     for raw in raw_items[: limit * 3]:
         cve_id = raw.get("id") or raw.get("cve") or "UNKNOWN-CVE"
-        summary = raw.get("summary", "No summary provided.")
+        summary = raw.get("summary") or "No summary provided."
         cvss = _to_float(raw.get("cvss") or raw.get("cvss3"))
         severity = classify_severity(cvss, summary)
         cves.append(CVEItem(cve_id=cve_id, summary=summary, severity=severity, cvss=cvss))
 
-    cves.sort(key=lambda x: x.cvss, reverse=True)
+    cves.sort(key=lambda item: item.cvss, reverse=True)
     return cves[:limit]
