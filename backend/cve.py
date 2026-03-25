@@ -1,14 +1,10 @@
-"""CVE aggregation logic."""
+"""CVE collector."""
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
-from typing import List
 
 import requests
-
-LOGGER = logging.getLogger(__name__)
 
 CVE_API_URL = "https://cve.circl.lu/api/last"
 
@@ -18,7 +14,6 @@ class CVEItem:
     cve_id: str
     summary: str
     severity: str
-    cvss: float
 
 
 def _to_float(value: object) -> float:
@@ -28,33 +23,31 @@ def _to_float(value: object) -> float:
         return 0.0
 
 
-def classify_severity(cvss: float, summary: str) -> str:
+def _severity(cvss: float, summary: str) -> str:
     text = (summary or "").lower()
-    if cvss >= 9.0 or "critical" in text or "actively exploited" in text:
+    if cvss >= 9.0 or "critical" in text:
         return "CRITICAL"
-    if cvss >= 7.0 or "rce" in text:
+    if cvss >= 7.0 or "rce" in text or "zero-day" in text:
         return "HIGH"
     if cvss >= 4.0:
         return "MEDIUM"
     return "LOW"
 
 
-def fetch_latest_cves(limit: int = 10) -> List[CVEItem]:
+def fetch_latest_cves(limit: int = 30) -> list[CVEItem]:
     try:
         response = requests.get(CVE_API_URL, timeout=20)
         response.raise_for_status()
-        raw_items = response.json()
-    except Exception as exc:
-        LOGGER.error("Failed to fetch CVEs: %s", exc)
+        entries = response.json()
+    except Exception:
         return []
 
-    cves: List[CVEItem] = []
-    for raw in raw_items[: limit * 3]:
+    results: list[CVEItem] = []
+    for raw in entries[: limit * 2]:
         cve_id = raw.get("id") or raw.get("cve") or "UNKNOWN-CVE"
         summary = raw.get("summary") or "No summary provided."
         cvss = _to_float(raw.get("cvss") or raw.get("cvss3"))
-        severity = classify_severity(cvss, summary)
-        cves.append(CVEItem(cve_id=cve_id, summary=summary, severity=severity, cvss=cvss))
+        results.append(CVEItem(cve_id=cve_id, summary=summary, severity=_severity(cvss, summary)))
 
-    cves.sort(key=lambda item: item.cvss, reverse=True)
-    return cves[:limit]
+    unique: dict[str, CVEItem] = {item.cve_id: item for item in results}
+    return list(unique.values())[:limit]

@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cyber Intelligence Platform</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>Cyber Intelligence Platform</h1>
+    <div class="filters">
+      <input id="searchInput" type="text" placeholder="Search threats, CVEs, sources..." />
+      <select id="categoryFilter">
+        <option value="">All Categories</option>
+        <option value="security">Security</option>
+        <option value="linux">Linux</option>
+        <option value="windows">Windows</option>
+        <option value="threat">Threat</option>
+      </select>
+      <select id="severityFilter">
+        <option value="">All Severities</option>
+        <option value="CRITICAL">Critical</option>
+        <option value="HIGH">High</option>
+        <option value="MEDIUM">Medium</option>
+        <option value="LOW">Low</option>
+      </select>
+      <button id="refreshBtn">Refresh</button>
+    </div>
+  </header>
+
+  <nav>
+    <button class="tab-btn active" data-tab="dashboard">Dashboard</button>
+    <button class="tab-btn" data-tab="cves">CVE Page</button>
+    <button class="tab-btn" data-tab="alerts">Alerts</button>
+  </nav>
+
+  <main>
+    <section id="dashboard" class="tab active">
+      <h2>News Dashboard</h2>
+      <div id="newsList" class="grid"></div>
+    </section>
+
+    <section id="cves" class="tab">
+      <h2>CVE Page</h2>
+      <div id="cveList" class="grid"></div>
+    </section>
+
+    <section id="alerts" class="tab">
+      <h2>Alerts Page</h2>
+      <div id="alertList" class="grid"></div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,41 +1,11 @@
-# Cyber Intelligence Hub
+# Cyber Intelligence Platform
 
-Advanced Discord bot for cybersecurity, Linux, Windows, and threat intelligence monitoring from public/ethical data sources.
+## Components
 
-## Architecture
-
-```
-.
-├── main.py
-├── feeds.py
-├── cve.py
-├── ai.py
-├── db.py
-├── scoring.py
-├── config.py
-├── requirements.txt
-└── .env.example
-```
-
-## Data Sources
-
-### RSS
-- Cybersecurity
-  - https://www.bleepingcomputer.com/feed/
-  - https://feeds.feedburner.com/TheHackersNews
-  - https://krebsonsecurity.com/feed/
-  - https://www.darkreading.com/rss.xml
-  - https://www.securityweek.com/feed/
-- Linux
-  - https://www.phoronix.com/rss.php
-  - https://www.omgubuntu.co.uk/feed
-  - https://itsfoss.com/feed/
-- Windows
-  - https://www.windowscentral.com/rss
-  - https://msrc.microsoft.com/update-guide/rss
-
-### APIs
-- https://cve.circl.lu/api/last
+- Discord Bot (`bot/bot.py`)
+- REST API + Collector Worker (`backend/main.py`, `backend/api.py`)
+- Web Dashboard (`frontend/index.html`, `frontend/app.js`, `frontend/style.css`)
+- MySQL database
 
 ## MySQL Schema
 
@@ -49,9 +19,10 @@ CREATE TABLE IF NOT EXISTS news (
   link TEXT NOT NULL,
   source VARCHAR(255) NOT NULL,
   category VARCHAR(32) NOT NULL,
-  severity_score INT NOT NULL DEFAULT 0,
+  severity VARCHAR(16) NOT NULL,
+  summary TEXT,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE KEY uniq_link (link(255))
+  UNIQUE KEY uniq_news_link (link(255))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS cves (
@@ -60,45 +31,53 @@ CREATE TABLE IF NOT EXISTS cves (
   summary TEXT,
   severity VARCHAR(16) NOT NULL,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE KEY uniq_cve (cve_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
-CREATE TABLE IF NOT EXISTS logs (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  message TEXT NOT NULL,
-  level VARCHAR(16) NOT NULL,
-  timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
-CREATE TABLE IF NOT EXISTS keyword_hits (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  keyword VARCHAR(100) NOT NULL,
-  hit_count INT NOT NULL DEFAULT 0,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  UNIQUE KEY uniq_keyword (keyword)
+  UNIQUE KEY uniq_cve_id (cve_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 
-## Setup
+## Setup Instructions
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env
-export $(grep -v '^#' .env | xargs)
+```
+
+Create `.env`:
+
+```bash
+DISCORD_BOT_TOKEN=your_discord_token
+OPENAI_API_KEY=your_openai_api_key
+OPENAI_MODEL=gpt-4o-mini
+MYSQL_HOST=127.0.0.1
+MYSQL_PORT=3306
+MYSQL_USER=cyberbot_user
+MYSQL_PASSWORD=change_this_password
+MYSQL_DATABASE=cyberbot
+API_PORT=8000
+API_BASE_URL=http://127.0.0.1:8000
+COLLECT_INTERVAL_SECONDS=1800
+```
+
+Run backend API + worker:
+
+```bash
+cd backend
 python main.py
 ```
 
-## Commands
-- `!news linux`
-- `!news windows`
-- `!news security`
-- `!alerts`
-- `!cve`
-- `!trend`
+Run Discord bot:
 
-## Security Constraints
-- No TOR/dark-web scraping.
-- No illegal hacking instructions.
-- Public, ethical, defensive intelligence only.
+```bash
+cd bot
+python bot.py
+```
+
+Run frontend (static server):
+
+```bash
+cd frontend
+python -m http.server 5500
+```
+
+Open: `http://127.0.0.1:5500`
