@@ -1,4 +1,4 @@
-"""Discord bot entrypoint for cybersecurity and tech intelligence automation."""
+"""Discord bot entrypoint for Cyber Intelligence Bot."""
 
 from __future__ import annotations
 
@@ -9,18 +9,24 @@ from discord.ext import commands, tasks
 
 from ai import AISummarizer, short_summary
 from config import CATEGORY_KEYWORDS, load_settings
-from cve import fetch_latest_cves
+from cve import CVEItem, fetch_latest_cves
 from db import Database
-from feeds import extract_trend_keywords, fetch_critical_alerts, fetch_news
+from feeds import NewsItem, extract_trend_keywords, fetch_critical_alerts, fetch_news
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-LOGGER = logging.getLogger("cyber-intel-bot")
+LOGGER = logging.getLogger("cyber-intelligence-bot")
 
 settings = load_settings()
-db = Database(settings.db_path)
+db = Database(
+    host=settings.mysql_host,
+    port=settings.mysql_port,
+    user=settings.mysql_user,
+    password=settings.mysql_password,
+    database=settings.mysql_database,
+)
 ai = AISummarizer(api_key=settings.openai_api_key, model=settings.openai_model)
 
 intents = discord.Intents.default()
@@ -39,16 +45,29 @@ def emoji_for_item(title: str, summary: str, critical: bool) -> str:
     return "🔐"
 
 
-def make_news_embed(title: str, summary: str, source: str, link: str, critical: bool) -> discord.Embed:
-    marker = emoji_for_item(title, summary, critical)
+def make_news_embed(item: NewsItem, summary: str) -> discord.Embed:
+    marker = emoji_for_item(item.title, summary, item.critical)
     embed = discord.Embed(
-        title=f"{marker} {title}",
+        title=f"{marker} {item.title}",
         description=short_summary(summary),
-        color=discord.Color.red() if critical else discord.Color.blurple(),
+        color=discord.Color.red() if item.critical else discord.Color.blurple(),
     )
-    embed.add_field(name="Source", value=source, inline=True)
-    embed.add_field(name="Link", value=f"[Read more]({link})", inline=True)
-    embed.set_footer(text="Cybersecurity & Tech Intelligence Hub")
+    embed.add_field(name="Source", value=item.source, inline=True)
+    embed.add_field(name="URL", value=f"[Open article]({item.link})", inline=True)
+    embed.set_footer(text="Cyber Intelligence Bot")
+    return embed
+
+
+def make_cve_embed(cve: CVEItem) -> discord.Embed:
+    icon = "🚨" if cve.severity == "critical" else "🔐"
+    embed = discord.Embed(
+        title=f"{icon} {cve.cve_id}",
+        description=short_summary(cve.summary, limit=500),
+        color=discord.Color.red() if cve.severity == "critical" else discord.Color.orange(),
+    )
+    embed.add_field(name="Severity", value=f"{cve.severity.upper()} (CVSS {cve.cvss:.1f})", inline=True)
+    embed.add_field(name="Source", value="cve.circl.lu", inline=True)
+    embed.set_footer(text="Use this intelligence for defensive prioritization")
     return embed
 
 
@@ -73,11 +92,9 @@ async def news_cmd(ctx: commands.Context, category: str) -> None:
         return
 
     db.update_keyword_hits([kw for item in items for kw in item.matched_keywords])
-
     for item in items:
         summary = ai.summarize(item.title, item.description, item.source)
-        embed = make_news_embed(item.title, summary, item.source, item.link, item.critical)
-        await ctx.send(embed=embed)
+        await ctx.send(embed=make_news_embed(item, summary))
 
 
 @bot.command(name="alerts")
@@ -90,8 +107,7 @@ async def alerts_cmd(ctx: commands.Context) -> None:
 
     for item in alerts:
         summary = ai.summarize(item.title, item.description, item.source)
-        embed = make_news_embed(item.title, summary, item.source, item.link, critical=True)
-        await ctx.send(embed=embed)
+        await ctx.send(embed=make_news_embed(item, summary))
 
 
 @bot.command(name="cve")
@@ -102,21 +118,16 @@ async def cve_cmd(ctx: commands.Context) -> None:
         await ctx.send("Unable to fetch CVE data right now.")
         return
 
+    posted = 0
     for cve in cves:
-        if db.has_shown_cve(cve.cve_id):
+        if db.has_cve(cve.cve_id):
             continue
+        db.store_cve(cve.cve_id, cve.summary, cve.severity, cve.cvss)
+        await ctx.send(embed=make_cve_embed(cve))
+        posted += 1
 
-        icon = "🚨" if cve.severity == "critical" else "🔐"
-        embed = discord.Embed(
-            title=f"{icon} {cve.cve_id}",
-            description=short_summary(cve.summary, limit=500),
-            color=discord.Color.red() if cve.severity == "critical" else discord.Color.orange(),
-        )
-        embed.add_field(name="Severity", value=f"{cve.severity.upper()} (CVSS: {cve.cvss:.1f})", inline=True)
-        embed.add_field(name="Source", value="CIRCL CVE API", inline=True)
-        embed.set_footer(text="Use this for defensive prioritization.")
-        await ctx.send(embed=embed)
-        db.mark_cve_shown(cve.cve_id, cve.severity)
+    if posted == 0:
+        await ctx.send("No new CVEs since the last sync.")
 
 
 @bot.command(name="trend")
@@ -126,9 +137,9 @@ async def trend_cmd(ctx: commands.Context) -> None:
         await ctx.send("No trend data yet. Run `!news` commands first.")
         return
 
-    lines = [f"• **{kw}**: {count}" for kw, count in trends]
+    lines = [f"• **{keyword}**: {count}" for keyword, count in trends]
     embed = discord.Embed(
-        title="📈 Threat Keyword Trends",
+        title="📈 Top Threat Trends",
         description="\n".join(lines),
         color=discord.Color.green(),
     )
@@ -154,12 +165,8 @@ async def auto_post_news() -> None:
             continue
 
         summary = ai.summarize(item.title, item.description, item.source)
-        embed = make_news_embed(item.title, summary, item.source, item.link, item.critical)
-        try:
-            await channel.send(embed=embed)
-            db.mark_link_posted(item.link, item.title, item.source, "security")
-        except Exception as exc:
-            LOGGER.error("Failed to auto-post item %s: %s", item.link, exc)
+        await channel.send(embed=make_news_embed(item, summary))
+        db.mark_link_posted(item.title, item.link, "security", item.source)
 
 
 @auto_post_news.before_loop

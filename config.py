@@ -1,10 +1,10 @@
-"""Configuration and constants for the Cybersecurity & Tech Intelligence Hub bot."""
+"""Configuration and constants for Cyber Intelligence Bot."""
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import List
+from typing import Dict, List
 
 
 @dataclass(frozen=True)
@@ -13,8 +13,12 @@ class Settings:
     openai_api_key: str
     post_channel_id: int
     post_interval_minutes: int
-    db_path: str
     openai_model: str
+    mysql_host: str
+    mysql_port: int
+    mysql_user: str
+    mysql_password: str
+    mysql_database: str
 
 
 RSS_FEEDS: List[str] = [
@@ -34,13 +38,13 @@ DEFAULT_KEYWORDS: List[str] = [
     "windows",
 ]
 
-CATEGORY_KEYWORDS = {
+CATEGORY_KEYWORDS: Dict[str, List[str]] = {
     "linux": ["linux", "kernel", "ubuntu", "debian", "red hat", "rhel", "fedora", "centos"],
     "windows": ["windows", "microsoft", "patch tuesday", "active directory", "defender"],
     "security": ["security", "vulnerability", "exploit", "zero-day", "breach", "ransomware", "malware"],
 }
 
-CRITICAL_KEYWORDS = [
+CRITICAL_KEYWORDS: List[str] = [
     "critical",
     "actively exploited",
     "remote code execution",
@@ -65,6 +69,10 @@ def load_settings() -> Settings:
         openai_api_key=_require_env("OPENAI_API_KEY"),
         post_channel_id=int(_require_env("DISCORD_POST_CHANNEL_ID")),
         post_interval_minutes=int(os.getenv("POST_INTERVAL_MINUTES", "30")),
-        db_path=os.getenv("DB_PATH", "intel_hub.db"),
         openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        mysql_host=os.getenv("MYSQL_HOST", "127.0.0.1"),
+        mysql_port=int(os.getenv("MYSQL_PORT", "3306")),
+        mysql_user=_require_env("MYSQL_USER"),
+        mysql_password=_require_env("MYSQL_PASSWORD"),
+        mysql_database=os.getenv("MYSQL_DATABASE", "cyberbot"),
     )
