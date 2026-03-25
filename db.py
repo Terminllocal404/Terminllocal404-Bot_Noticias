@@ -1,129 +1,187 @@
-"""SQLite storage for deduplication, CVE tracking, and trend analytics."""
+"""MySQL storage for deduplication, CVE tracking, and trend analytics."""
 
 from __future__ import annotations
 
-import sqlite3
+import time
+from collections.abc import Iterable
 from contextlib import contextmanager
-from datetime import datetime, timezone
-from typing import Generator, Iterable, List, Tuple
+from typing import Generator, List, Tuple
+
+import mysql.connector
+from mysql.connector import Error, MySQLConnection
 
 
 class Database:
-    def __init__(self, db_path: str) -> None:
-        self.db_path = db_path
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        user: str,
+        password: str,
+        database: str,
+    ) -> None:
+        self._config = {
+            "host": host,
+            "port": port,
+            "user": user,
+            "password": password,
+            "database": database,
+            "autocommit": False,
+            "connection_timeout": 10,
+        }
+        self._conn: MySQLConnection | None = None
+        self._ensure_connection()
         self._init_db()
 
+    def _ensure_connection(self) -> None:
+        if self._conn and self._conn.is_connected():
+            return
+
+        for attempt in range(1, 4):
+            try:
+                self._conn = mysql.connector.connect(**self._config)
+                return
+            except Error:
+                if attempt == 3:
+                    raise
+                time.sleep(2)
+
     @contextmanager
-    def _connect(self) -> Generator[sqlite3.Connection, None, None]:
-        conn = sqlite3.connect(self.db_path)
+    def _cursor(self, dictionary: bool = False):
+        self._ensure_connection()
+        if self._conn is None:
+            raise RuntimeError("MySQL connection is not available")
+
         try:
-            yield conn
+            cursor = self._conn.cursor(dictionary=dictionary)
+            yield cursor
+            self._conn.commit()
+        except Error:
+            if self._conn:
+                self._conn.rollback()
+            self._conn = None
+            raise
         finally:
-            conn.close()
+            if 'cursor' in locals() and cursor:
+                cursor.close()
+
+    def close(self) -> None:
+        if self._conn and self._conn.is_connected():
+            self._conn.close()
 
     def _init_db(self) -> None:
-        with self._connect() as conn:
-            cursor = conn.cursor()
+        with self._cursor() as cursor:
             cursor.execute(
                 """
-                CREATE TABLE IF NOT EXISTS posted_news (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    link TEXT UNIQUE NOT NULL,
+                CREATE TABLE IF NOT EXISTS news (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
                     title TEXT NOT NULL,
-                    source TEXT,
-                    category TEXT,
-                    posted_at TEXT NOT NULL
-                )
+                    link TEXT NOT NULL,
+                    category VARCHAR(50) NOT NULL,
+                    source VARCHAR(255) NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE KEY uniq_link (link(255))
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
             cursor.execute(
                 """
-                CREATE TABLE IF NOT EXISTS shown_cves (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    cve_id TEXT UNIQUE NOT NULL,
-                    severity TEXT,
-                    shown_at TEXT NOT NULL
-                )
+                CREATE TABLE IF NOT EXISTS cves (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    cve_id VARCHAR(64) NOT NULL,
+                    summary TEXT,
+                    severity VARCHAR(16) NOT NULL,
+                    cvss FLOAT NOT NULL DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE KEY uniq_cve_id (cve_id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS logs (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    message TEXT NOT NULL,
+                    level VARCHAR(16) NOT NULL,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS keyword_hits (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    keyword TEXT NOT NULL,
-                    hit_count INTEGER NOT NULL DEFAULT 0,
-                    updated_at TEXT NOT NULL,
-                    UNIQUE(keyword)
-                )
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    keyword VARCHAR(100) NOT NULL,
+                    hit_count INT NOT NULL DEFAULT 0,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY uniq_keyword (keyword)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
-            conn.commit()
 
     def has_posted_link(self, link: str) -> bool:
-        with self._connect() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT 1 FROM posted_news WHERE link = ? LIMIT 1", (link,))
+        with self._cursor() as cursor:
+            cursor.execute("SELECT 1 FROM news WHERE link = %s LIMIT 1", (link,))
             return cursor.fetchone() is not None
 
-    def mark_link_posted(self, link: str, title: str, source: str, category: str) -> None:
-        now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
-            cursor = conn.cursor()
+    def mark_link_posted(self, title: str, link: str, category: str, source: str) -> None:
+        with self._cursor() as cursor:
             cursor.execute(
                 """
-                INSERT OR IGNORE INTO posted_news(link, title, source, category, posted_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO news (title, link, category, source)
+                VALUES (%s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE title = VALUES(title), category = VALUES(category), source = VALUES(source)
                 """,
-                (link, title, source, category, now),
+                (title, link, category, source),
             )
-            conn.commit()
 
-    def has_shown_cve(self, cve_id: str) -> bool:
-        with self._connect() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT 1 FROM shown_cves WHERE cve_id = ? LIMIT 1", (cve_id,))
+    def has_cve(self, cve_id: str) -> bool:
+        with self._cursor() as cursor:
+            cursor.execute("SELECT 1 FROM cves WHERE cve_id = %s LIMIT 1", (cve_id,))
             return cursor.fetchone() is not None
 
-    def mark_cve_shown(self, cve_id: str, severity: str) -> None:
-        now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
-            cursor = conn.cursor()
+    def store_cve(self, cve_id: str, summary: str, severity: str, cvss: float) -> None:
+        with self._cursor() as cursor:
             cursor.execute(
                 """
-                INSERT OR IGNORE INTO shown_cves(cve_id, severity, shown_at)
-                VALUES (?, ?, ?)
+                INSERT INTO cves (cve_id, summary, severity, cvss)
+                VALUES (%s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    summary = VALUES(summary),
+                    severity = VALUES(severity),
+                    cvss = VALUES(cvss)
                 """,
-                (cve_id, severity, now),
+                (cve_id, summary, severity, cvss),
             )
-            conn.commit()
 
     def update_keyword_hits(self, keywords: Iterable[str]) -> None:
-        now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as conn:
-            cursor = conn.cursor()
+        with self._cursor() as cursor:
             for keyword in keywords:
                 cursor.execute(
                     """
-                    INSERT INTO keyword_hits(keyword, hit_count, updated_at)
-                    VALUES (?, 1, ?)
-                    ON CONFLICT(keyword) DO UPDATE SET
-                        hit_count = hit_count + 1,
-                        updated_at = excluded.updated_at
+                    INSERT INTO keyword_hits (keyword, hit_count)
+                    VALUES (%s, 1)
+                    ON DUPLICATE KEY UPDATE hit_count = hit_count + 1
                     """,
-                    (keyword.lower(), now),
+                    (keyword.lower(),),
                 )
-            conn.commit()
 
     def top_trends(self, limit: int = 10) -> List[Tuple[str, int]]:
-        with self._connect() as conn:
-            cursor = conn.cursor()
+        with self._cursor() as cursor:
             cursor.execute(
                 """
                 SELECT keyword, hit_count
                 FROM keyword_hits
                 ORDER BY hit_count DESC, keyword ASC
-                LIMIT ?
+                LIMIT %s
                 """,
                 (limit,),
             )
-            return cursor.fetchall()
+            return list(cursor.fetchall())
+
+    def log(self, message: str, level: str = "INFO") -> None:
+        with self._cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO logs (message, level) VALUES (%s, %s)",
+                (message, level.upper()),
+            )
