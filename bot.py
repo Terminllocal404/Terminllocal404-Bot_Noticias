@@ -1,479 +1,394 @@
 import asyncio
 import logging
-import sqlite3
 import os
-import aiohttp
+import re
 from datetime import datetime, timezone
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Any
 
 import discord
+import feedparser
+import aiohttp
+import aiomysql
 from discord import app_commands
 from discord.ext import commands, tasks
-import feedparser
 from openai import AsyncOpenAI
 
 # ==========================================
-# INSTRUÇÕES DE CONFIGURAÇÃO E PERMISSÕES
+# LOGGING CONFIGURATION
 # ==========================================
-# 1. Acesse https://discord.com/developers/applications
-# 2. No menu 'OAuth2' -> 'URL Generator':
-#    - Marque os Escopos: 'bot', 'applications.commands'
-#    - Marque as Permissões do Bot: 'Send Messages', 'Embed Links', 'Read Message History', 'Use Slash Commands'
-# 3. Use a URL gerada para convidar o bot para o seu servidor.
-# 4. Certifique-se de que 'Message Content Intent' esteja ATIVADO em 'Bot' -> 'Privileged Gateway Intents'.
-
-# ==========================================
-# CONFIGURAÇÃO DO BOT (INSIRA SEUS DADOS AQUI)
-# ==========================================
-DISCORD_TOKEN = "SEU_TOKEN_AQUI"
-OPENAI_API_KEY = "SUA_CHAVE_OPENAI_AQUI"
-
-# ID do canal para notícias críticas automáticas (Destaques)
-CHANNEL_ID_HIGHLIGHTS = 123456789012345678
-
-# Configurações Gerais
-CHECK_INTERVAL_MINUTES = 30
-DATABASE_NAME = "tech_intel_bot.db"
-OPENAI_MODEL = "gpt-4o-mini"
-
-# Fontes RSS (Incluindo Reddit via RSS)
-RSS_FEEDS = {
-    "security": [
-        "https://www.bleepingcomputer.com/feed/",
-        "https://feeds.feedburner.com/TheHackersNews",
-        "https://www.reddit.com/r/netsec/.rss",
-        "https://www.reddit.com/r/cybersecurity/.rss"
-    ],
-    "windows": [
-        "https://news.microsoft.com/feed/",
-        "https://www.reddit.com/r/windows/.rss",
-        "https://www.windowslatest.com/feed/"
-    ],
-    "linux": [
-        "https://www.phoronix.com/rss.php",
-        "https://linuxmagazine.com/rss/feed/lmi_news",
-        "https://www.reddit.com/r/linux/.rss"
-    ]
-}
-
-# API de CVEs (Vulnerabilidades)
-CVE_API_URL = "https://cve.circl.lu/api/last"
-
-# Configuração de Logs
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-LOGGER = logging.getLogger("TechIntelBot")
+LOGGER = logging.getLogger("TechNewsBot")
 
 # ==========================================
-# BANCO DE DADOS (SQLite)
+# ENVIRONMENT VARIABLES
 # ==========================================
-class Database:
-    """Gerencia a persistência de notícias e preferências dos usuários."""
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        self._init_db()
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+MYSQL_HOST = os.getenv("MYSQL_HOST")
+MYSQL_USER = os.getenv("MYSQL_USER")
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD")
+MYSQL_DATABASE = os.getenv("MYSQL_DATABASE")
 
-    def _connect(self):
-        return sqlite3.connect(self.db_path)
-
-    def _init_db(self):
-        with self._connect() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS news_cache (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    link TEXT UNIQUE NOT NULL,
-                    title TEXT NOT NULL,
-                    summary_raw TEXT,
-                    summary_ai TEXT,
-                    category TEXT,
-                    source TEXT,
-                    is_critical INTEGER DEFAULT 0,
-                    collected_at TEXT NOT NULL
-                )
-            """)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS user_monitors (
-                    user_id INTEGER NOT NULL,
-                    keyword TEXT NOT NULL,
-                    PRIMARY KEY (user_id, keyword)
-                )
-            """)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS sent_notifications (
-                    user_id INTEGER,
-                    news_link TEXT,
-                    sent_at TEXT,
-                    PRIMARY KEY (user_id, news_link)
-                )
-            """)
-            conn.commit()
-
-    def save_news(self, news_data: dict):
-        with self._connect() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT OR IGNORE INTO news_cache (link, title, summary_raw, category, source, is_critical, collected_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (
-                news_data['link'], news_data['title'], news_data['summary_raw'],
-                news_data['category'], news_data['source'], news_data['is_critical'],
-                datetime.now(timezone.utc).isoformat()
-            ))
-            conn.commit()
-
-    def update_ai_summary(self, link: str, summary_ai: str):
-        with self._connect() as conn:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE news_cache SET summary_ai = ? WHERE link = ?", (summary_ai, link))
-            conn.commit()
-
-    def get_news_by_category(self, category: str, limit: int = 5) -> List[dict]:
-        with self._connect() as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM news_cache WHERE category = ? ORDER BY collected_at DESC LIMIT ?", (category, limit))
-            return [dict(row) for row in cursor.fetchall()]
-
-    def search_news(self, query: str, limit: int = 5) -> List[dict]:
-        with self._connect() as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT * FROM news_cache
-                WHERE title LIKE ? OR summary_raw LIKE ?
-                ORDER BY collected_at DESC LIMIT ?
-            """, (f'%{query}%', f'%{query}%', limit))
-            return [dict(row) for row in cursor.fetchall()]
-
-    def add_monitor(self, user_id: int, keyword: str):
-        with self._connect() as conn:
-            cursor = conn.cursor()
-            cursor.execute("INSERT OR IGNORE INTO user_monitors (user_id, keyword) VALUES (?, ?)", (user_id, keyword.lower()))
-            conn.commit()
-
-    def get_user_monitors(self) -> List[Tuple[int, str]]:
-        with self._connect() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT user_id, keyword FROM user_monitors")
-            return cursor.fetchall()
-
-    def mark_as_sent_to_user(self, user_id: int, link: str):
-        with self._connect() as conn:
-            cursor = conn.cursor()
-            cursor.execute("INSERT OR IGNORE INTO sent_notifications (user_id, news_link, sent_at) VALUES (?, ?, ?)",
-                           (user_id, link, datetime.now(timezone.utc).isoformat()))
-            conn.commit()
-
-    def was_sent_to_user(self, user_id: int, link: str) -> bool:
-        with self._connect() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT 1 FROM sent_notifications WHERE user_id = ? AND news_link = ?", (user_id, link))
-            return cursor.fetchone() is not None
+# Required IDs (can be configured via env or logic)
+AUTO_POST_CHANNEL_ID = int(os.getenv("AUTO_POST_CHANNEL_ID", "0"))
 
 # ==========================================
-# INTEGRAÇÃO COM IA (Async OpenAI)
+# DATA LAYER (RSS & SOURCES)
+# ==========================================
+RSS_SOURCES = [
+    "https://thehackernews.com/feeds/posts/default",
+    "https://www.bleepingcomputer.com/feed/",
+    "https://www.reddit.com/r/linux/.rss",
+    "https://www.reddit.com/r/windows/.rss",
+    "https://www.reddit.com/r/netsec/.rss",
+    "https://www.reddit.com/r/cybersecurity/.rss"
+]
+
+# ==========================================
+# DATABASE LAYER (MYSQL)
+# ==========================================
+class DatabaseManager:
+    def __init__(self):
+        self.pool: Optional[aiomysql.Pool] = None
+
+    async def initialize(self):
+        try:
+            self.pool = await aiomysql.create_pool(
+                host=MYSQL_HOST,
+                user=MYSQL_USER,
+                password=MYSQL_PASSWORD,
+                db=MYSQL_DATABASE,
+                autocommit=True
+            )
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("""
+                        CREATE TABLE IF NOT EXISTS news (
+                            id INT AUTO_INCREMENT PRIMARY KEY,
+                            title VARCHAR(255) NOT NULL,
+                            link VARCHAR(512) UNIQUE NOT NULL,
+                            source VARCHAR(100),
+                            category VARCHAR(50),
+                            summary_raw TEXT,
+                            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
+                    await cur.execute("""
+                        CREATE TABLE IF NOT EXISTS processed_news (
+                            id INT AUTO_INCREMENT PRIMARY KEY,
+                            news_id INT NOT NULL,
+                            summary TEXT NOT NULL,
+                            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            FOREIGN KEY (news_id) REFERENCES news(id) ON DELETE CASCADE
+                        )
+                    """)
+                    await cur.execute("""
+                        CREATE TABLE IF NOT EXISTS user_search_history (
+                            id INT AUTO_INCREMENT PRIMARY KEY,
+                            user_id BIGINT NOT NULL,
+                            query VARCHAR(255) NOT NULL,
+                            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
+                    await cur.execute("""
+                        CREATE TABLE IF NOT EXISTS user_monitors (
+                            id INT AUTO_INCREMENT PRIMARY KEY,
+                            user_id BIGINT NOT NULL,
+                            topic VARCHAR(255) NOT NULL,
+                            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
+            LOGGER.info("MySQL Database initialized successfully.")
+        except Exception as e:
+            LOGGER.error(f"Failed to initialize database: {e}")
+            raise
+
+    async def save_news(self, title: str, link: str, source: str, category: str, summary_raw: str) -> Optional[int]:
+        try:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "INSERT IGNORE INTO news (title, link, source, category, summary_raw) VALUES (%s, %s, %s, %s, %s)",
+                        (title[:255], link, source, category, summary_raw)
+                    )
+                    if cur.rowcount > 0:
+                        return cur.lastrowid
+            return None
+        except Exception as e:
+            LOGGER.error(f"Error saving news: {e}")
+            return None
+
+    async def get_processed_summary(self, news_id: int) -> Optional[str]:
+        try:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT summary FROM processed_news WHERE news_id = %s", (news_id,))
+                    result = await cur.fetchone()
+                    return result[0] if result else None
+        except Exception as e:
+            LOGGER.error(f"Error getting processed summary: {e}")
+            return None
+
+    async def save_processed_summary(self, news_id: int, summary: str):
+        try:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("INSERT INTO processed_news (news_id, summary) VALUES (%s, %s)", (news_id, summary))
+        except Exception as e:
+            LOGGER.error(f"Error saving processed summary: {e}")
+
+    async def search_news(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+        try:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor(aiomysql.DictCursor) as cur:
+                    await cur.execute(
+                        "SELECT * FROM news WHERE title LIKE %s OR summary_raw LIKE %s ORDER BY created_at DESC LIMIT %s",
+                        (f"%{query}%", f"%{query}%", limit)
+                    )
+                    return await cur.fetchall()
+        except Exception as e:
+            LOGGER.error(f"Error searching news: {e}")
+            return []
+
+    async def get_latest_by_category(self, category: str, limit: int = 5) -> List[Dict[str, Any]]:
+        try:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor(aiomysql.DictCursor) as cur:
+                    await cur.execute(
+                        "SELECT * FROM news WHERE category = %s ORDER BY created_at DESC LIMIT %s",
+                        (category, limit)
+                    )
+                    return await cur.fetchall()
+        except Exception as e:
+            LOGGER.error(f"Error fetching news by category: {e}")
+            return []
+
+    async def log_search(self, user_id: int, query: str):
+        try:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("INSERT INTO user_search_history (user_id, query) VALUES (%s, %s)", (user_id, query))
+        except Exception as e:
+            LOGGER.error(f"Error logging search: {e}")
+
+    async def add_monitor(self, user_id: int, topic: str):
+        try:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("INSERT INTO user_monitors (user_id, topic) VALUES (%s, %s)", (user_id, topic))
+        except Exception as e:
+            LOGGER.error(f"Error adding monitor: {e}")
+
+# ==========================================
+# AI PROCESSING LAYER (OPENAI)
 # ==========================================
 class AIService:
-    """Serviço assíncrono para resumos com a API da OpenAI."""
-    def __init__(self, api_key: str, model: str):
-        self.client = AsyncOpenAI(api_key=api_key) if api_key and "AQUI" not in api_key else None
-        self.model = model
+    def __init__(self):
+        self.client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-    async def summarize(self, title: str, content: str) -> str:
-        if not self.client:
-            return f"Nota: API OpenAI não configurada. Resumo original:\n{content[:300]}..."
+    async def process_with_ai(self, text: str) -> str:
+        """Translates to Portuguese, summarizes and highlights key points."""
+        if not OPENAI_API_KEY:
+            return "AI Key not configured."
 
         prompt = (
-            "Você é um jornalista de tecnologia especializado. "
-            "Resuma a notícia em PORTUGUÊS (Brasil) de forma clara e profissional. "
-            "Destaque os 3 pontos principais em tópicos.\n\n"
-            f"Título: {title}\nConteúdo: {content}"
+            "Você é um analista de segurança e tecnologia sênior. "
+            "Traduza o seguinte texto para o Português do Brasil, resuma-o e destaque os pontos principais. "
+            "O resumo deve ser objetivo e profissional.\n\n"
+            f"Texto: {text}"
         )
-        try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=500,
-                temperature=0.4
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            LOGGER.error(f"Erro OpenAI: {e}")
-            return "Erro ao gerar resumo automático. Por favor, acesse o link para mais detalhes."
+
+        retries = 1
+        for attempt in range(retries + 1):
+            try:
+                response = await asyncio.wait_for(
+                    self.client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=500,
+                        temperature=0.4
+                    ),
+                    timeout=20.0
+                )
+                return response.choices[0].message.content.strip()
+            except (asyncio.TimeoutError, Exception) as e:
+                if attempt < retries:
+                    LOGGER.warning(f"AI call failed (attempt {attempt+1}), retrying... Error: {e}")
+                    await asyncio.sleep(2)
+                    continue
+                LOGGER.error(f"Final AI call failed after {retries+1} attempts: {e}")
+                return f"Erro ao processar com IA: {str(e)}"
 
 # ==========================================
-# INTERFACE DO DISCORD (Buttons & Views)
+# BOT LAYER (DISCORD)
 # ==========================================
-class NewsPaginationView(discord.ui.View):
-    """View interativa para navegação entre as notícias."""
-    def __init__(self, news_list: List[dict], ai_service: AIService, db: Database, user_id: int):
-        super().__init__(timeout=120)
-        self.news_list = news_list
-        self.ai_service = ai_service
-        self.db = db
-        self.current_index = 0
-        self.user_id = user_id
-
-    async def create_embed(self):
-        item = self.news_list[self.current_index]
-
-        # Resumo sob demanda para economizar tokens
-        if not item.get('summary_ai'):
-            summary = await self.ai_service.summarize(item['title'], item['summary_raw'])
-            self.db.update_ai_summary(item['link'], summary)
-            item['summary_ai'] = summary
-
-        color = {
-            "security": discord.Color.red(),
-            "windows": discord.Color.blue(),
-            "linux": discord.Color.green()
-        }.get(item['category'], discord.Color.dark_grey())
-
-        embed = discord.Embed(
-            title=item['title'],
-            url=item['link'],
-            description=item['summary_ai'],
-            color=color,
-            timestamp=datetime.now()
-        )
-        embed.set_footer(text=f"Fonte: {item['source']} | Notícia {self.current_index + 1} de {len(self.news_list)}")
-        return embed
-
-    @discord.ui.button(label="⬅️ Anterior", style=discord.ButtonStyle.primary)
-    async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.user_id:
-            return await interaction.response.send_message("Use /buscar para criar sua própria consulta.", ephemeral=True)
-
-        self.current_index = (self.current_index - 1) % len(self.news_list)
-        await interaction.response.edit_message(embed=await self.create_embed(), view=self)
-
-    @discord.ui.button(label="➡️ Próxima", style=discord.ButtonStyle.primary)
-    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.user_id:
-            return await interaction.response.send_message("Use /buscar para criar sua própria consulta.", ephemeral=True)
-
-        self.current_index = (self.current_index + 1) % len(self.news_list)
-        await interaction.response.edit_message(embed=await self.create_embed(), view=self)
-
-    @discord.ui.button(label="🔄 Atualizar", style=discord.ButtonStyle.secondary)
-    async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Força um novo resumo da IA
-        item = self.news_list[self.current_index]
-        await interaction.response.defer()
-        summary = await self.ai_service.summarize(item['title'], item['summary_raw'])
-        self.db.update_ai_summary(item['link'], summary)
-        item['summary_ai'] = summary
-        await interaction.edit_original_response(embed=await self.create_embed(), view=self)
-
-# ==========================================
-# LÓGICA PRINCIPAL DO BOT
-# ==========================================
-class TechIntelBot(commands.Bot):
+class TechNewsBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
-        self.db = Database(DATABASE_NAME)
-        self.ai = AIService(OPENAI_API_KEY, OPENAI_MODEL)
+        self.db = DatabaseManager()
+        self.ai = AIService()
         self.session: Optional[aiohttp.ClientSession] = None
 
     async def setup_hook(self):
         self.session = aiohttp.ClientSession()
-        self.auto_collector.start()
+        await self.db.initialize()
+        self.rss_loop.start()
         await self.tree.sync()
-        LOGGER.info("Bot configurado e comandos sincronizados.")
+        LOGGER.info("TechNewsBot is ready and commands are synced.")
 
     async def on_resigned(self):
         if self.session:
             await self.session.close()
+        if self.db.pool:
+            self.db.pool.close()
+            await self.db.pool.wait_closed()
 
-    @tasks.loop(minutes=CHECK_INTERVAL_MINUTES)
-    async def auto_collector(self):
-        LOGGER.info("Iniciando ciclo de coleta assíncrona...")
-        await self.process_collection()
+    def classify_category(self, text: str) -> str:
+        text = text.lower()
+        security_keywords = ["vulnerability", "exploit", "cve", "breach", "ransomware", "hack", "security", "zero-day"]
+        windows_keywords = ["windows", "microsoft", "azure", "defender", "outlook"]
+        linux_keywords = ["linux", "kernel", "ubuntu", "debian", "red hat", "fedora", "distro"]
 
-    async def fetch_url(self, url: str) -> str:
-        """Busca conteúdo de uma URL de forma assíncrona."""
-        try:
-            async with self.session.get(url, timeout=15) as response:
-                if response.status == 200:
-                    return await response.text()
-        except Exception as e:
-            LOGGER.error(f"Erro ao acessar {url}: {e}")
-        return ""
+        if any(kw in text for kw in security_keywords):
+            return "security"
+        if any(kw in text for kw in windows_keywords):
+            return "windows"
+        if any(kw in text for kw in linux_keywords):
+            return "linux"
+        return "general"
 
-    async def process_collection(self):
-        # 1. Coleta de Feeds RSS
-        for category, urls in RSS_FEEDS.items():
-            for url in urls:
-                content = await self.fetch_url(url)
-                if content:
-                    feed = feedparser.parse(content)
-                    for entry in feed.entries:
-                        title = entry.get("title", "")
-                        link = entry.get("link", "")
-                        summary = entry.get("summary", "")
-                        source = feed.feed.get("title", "Fonte RSS")
-
-                        is_critical = self.check_critical(title, summary, 0)
-
-                        news_item = {
-                            "link": link, "title": title, "summary_raw": summary,
-                            "category": category, "source": source, "is_critical": is_critical
-                        }
-                        self.db.save_news(news_item)
-
-                        if is_critical:
-                            await self.send_highlight(news_item)
-
-        # 2. Coleta de CVEs
-        cve_content = await self.fetch_url(CVE_API_URL)
-        if cve_content:
+    def is_critical(self, text: str) -> bool:
+        text = text.lower()
+        critical_keywords = ["critical", "zero-day", "data breach", "ransomware"]
+        # Basic CVSS detection in text
+        cvss_match = re.search(r"cvss\s*(?:score)?\s*:?\s*([0-9.]+)", text)
+        if cvss_match:
             try:
-                import json
-                cves = json.loads(cve_content)
-                for cve in cves[:10]:
-                    cvss = float(cve.get("cvss", 0) or 0)
-                    is_critical = self.check_critical(cve.get("id", ""), cve.get("summary", ""), cvss)
+                score = float(cvss_match.group(1))
+                if score >= 9.0:
+                    return True
+            except ValueError:
+                pass
+        return any(kw in text for kw in critical_keywords)
 
-                    news_item = {
-                        "link": f"https://nvd.nist.gov/vuln/detail/{cve.get('id')}",
-                        "title": f"Vulnerabilidade: {cve.get('id')}",
-                        "summary_raw": cve.get("summary", ""),
-                        "category": "security", "source": "CIRCL CVE API", "is_critical": is_critical
-                    }
-                    self.db.save_news(news_item)
-
-                    if is_critical:
-                        await self.send_highlight(news_item)
-            except Exception as e:
-                LOGGER.error(f"Erro ao processar JSON de CVEs: {e}")
-
-        # 3. Notificar Monitores via DM
-        await self.notify_monitors()
-
-    def check_critical(self, title: str, summary: str, cvss: float) -> int:
-        text = (title + " " + summary).lower()
-        critical_keywords = ["critical", "zero-day", "massive leak", "data breach", "ransomware", "emergency patch"]
-
-        if cvss >= 9.0:
-            return 1
-        if any(kw in text for kw in critical_keywords):
-            return 1
-        return 0
-
-    async def send_highlight(self, item: dict):
-        channel = self.get_channel(CHANNEL_ID_HIGHLIGHTS)
-        if not channel:
-            return
-
-        # Para notícias críticas, geramos o resumo imediatamente
-        if not item.get('summary_ai'):
-            item['summary_ai'] = await self.ai.summarize(item['title'], item['summary_raw'])
-            self.db.update_ai_summary(item['link'], item['summary_ai'])
-
-        if not self.db.was_sent_to_user(CHANNEL_ID_HIGHLIGHTS, item['link']):
-            embed = discord.Embed(
-                title=f"🚨 ALERTA CRÍTICO: {item['title']}",
-                url=item['link'],
-                description=item['summary_ai'],
-                color=discord.Color.dark_red(),
-                timestamp=datetime.now()
-            )
-            embed.set_footer(text=f"Fonte: {item['source']} | Alerta Automático")
+    @tasks.loop(minutes=30)
+    async def rss_loop(self):
+        LOGGER.info("Starting RSS ingestion cycle...")
+        for url in RSS_SOURCES:
             try:
-                await channel.send(embed=embed)
-                self.db.mark_as_sent_to_user(CHANNEL_ID_HIGHLIGHTS, item['link'])
+                async with self.session.get(url, timeout=15) as response:
+                    if response.status == 200:
+                        content = await response.text()
+                        feed = feedparser.parse(content)
+                        for entry in feed.entries:
+                            title = entry.get("title", "")
+                            link = entry.get("link", "")
+                            summary_raw = entry.get("summary", "") or entry.get("description", "")
+                            source_name = feed.feed.get("title", "RSS Feed")
+
+                            category = self.classify_category(f"{title} {summary_raw}")
+
+                            news_id = await self.db.save_news(title, link, source_name, category, summary_raw)
+
+                            # Handle Auto-Send for Critical Items
+                            if news_id and self.is_critical(f"{title} {summary_raw}"):
+                                if AUTO_POST_CHANNEL_ID:
+                                    channel = self.get_channel(AUTO_POST_CHANNEL_ID)
+                                    if channel:
+                                        # Process with AI for critical alert
+                                        summary_ai = await self.ai.process_with_ai(f"{title}\n{summary_raw}")
+                                        await self.db.save_processed_summary(news_id, summary_ai)
+
+                                        embed = self.create_news_embed(title, summary_ai, source_name, link, category)
+                                        await channel.send(content="🚨 **ALERTA CRÍTICO DETECTADO**", embed=embed)
             except Exception as e:
-                LOGGER.error(f"Erro ao enviar destaque: {e}")
+                LOGGER.error(f"Error in RSS loop for {url}: {e}")
 
-    async def notify_monitors(self):
-        monitors = self.db.get_user_monitors()
-        for user_id, keyword in monitors:
-            relevant_news = self.db.search_news(keyword, limit=1)
-            if relevant_news:
-                item = relevant_news[0]
-                if not self.db.was_sent_to_user(user_id, item['link']):
-                    user = self.get_user(user_id) or await self.fetch_user(user_id)
-                    if user:
-                        try:
-                            if not item.get('summary_ai'):
-                                item['summary_ai'] = await self.ai.summarize(item['title'], item['summary_raw'])
-                                self.db.update_ai_summary(item['link'], item['summary_ai'])
+    def create_news_embed(self, title: str, summary: str, source: str, link: str, category: str) -> discord.Embed:
+        colors = {
+            "security": discord.Color.red(),
+            "windows": discord.Color.blue(),
+            "linux": discord.Color.green(),
+            "general": discord.Color.greyple()
+        }
+        embed = discord.Embed(
+            title=title[:250],
+            url=link,
+            description=summary[:4000],
+            color=colors.get(category, discord.Color.greyple()),
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.add_field(name="Fonte", value=source, inline=True)
+        embed.add_field(name="Categoria", value=category.capitalize(), inline=True)
+        embed.set_footer(text="Inteligência de Notícias Tech")
+        return embed
 
-                            embed = discord.Embed(
-                                title=f"🔔 Monitoramento: {keyword}",
-                                url=item['link'],
-                                description=f"**{item['title']}**\n\n{item['summary_ai']}",
-                                color=discord.Color.gold()
-                            )
-                            await user.send(embed=embed)
-                            self.db.mark_as_sent_to_user(user_id, item['link'])
-                        except discord.Forbidden:
-                            pass # DM bloqueada pelo usuário
-
-bot = TechIntelBot()
+bot = TechNewsBot()
 
 # ==========================================
-# SLASH COMMANDS
+# COMMANDS
 # ==========================================
 
-@bot.tree.command(name="buscar", description="Pesquisa notícias no arquivo do bot.")
-@app_commands.describe(termo="O que você deseja buscar? (ex: linux, exploit)")
-async def buscar(interaction: discord.Interaction, termo: str):
-    await interaction.response.defer()
-    results = bot.db.search_news(termo, limit=10)
+@bot.tree.command(name="buscar", description="Pesquisa notícias recentes e gera resumo com IA.")
+@app_commands.describe(query="Termo de pesquisa")
+async def buscar(interaction: discord.Interaction, query: str):
+    await interaction.response.defer(ephemeral=True)
+    await bot.db.log_search(interaction.user.id, query)
 
+    results = await bot.db.search_news(query, limit=5)
     if not results:
-        return await interaction.followup.send(f"Nenhum resultado para '{termo}'.")
+        return await interaction.followup.send("Nenhuma notícia relevante encontrada.", ephemeral=True)
 
-    view = NewsPaginationView(results, bot.ai, bot.db, interaction.user.id)
-    embed = await view.create_embed()
-    await interaction.followup.send(embed=embed, view=view)
+    embeds = []
+    for news in results:
+        # Check cache
+        summary_ai = await bot.db.get_processed_summary(news['id'])
+        if not summary_ai:
+            summary_ai = await bot.ai.process_with_ai(f"{news['title']}\n{news['summary_raw']}")
+            await bot.db.save_processed_summary(news['id'], summary_ai)
 
-@bot.tree.command(name="categoria", description="Exibe as últimas notícias de uma categoria.")
-@app_commands.choices(cat=[
-    app_commands.Choice(name="Segurança", value="security"),
-    app_commands.Choice(name="Windows", value="windows"),
+        embeds.append(bot.create_news_embed(news['title'], summary_ai, news['source'], news['link'], news['category']))
+
+    await interaction.followup.send(embeds=embeds[:5], ephemeral=True)
+
+@bot.tree.command(name="categoria", description="Mostra as 5 notícias mais recentes de uma categoria.")
+@app_commands.choices(category=[
     app_commands.Choice(name="Linux", value="linux"),
+    app_commands.Choice(name="Windows", value="windows"),
+    app_commands.Choice(name="Segurança", value="security"),
 ])
-async def categoria(interaction: discord.Interaction, cat: app_commands.Choice[str]):
-    await interaction.response.defer()
-    results = bot.db.get_news_by_category(cat.value, limit=5)
+async def categoria(interaction: discord.Interaction, category: app_commands.Choice[str]):
+    await interaction.response.defer(ephemeral=True)
 
+    results = await bot.db.get_latest_by_category(category.value, limit=5)
     if not results:
-        return await interaction.followup.send(f"Nenhuma notícia encontrada em {cat.name}.")
+        return await interaction.followup.send(f"Nenhuma notícia encontrada para a categoria {category.name}.", ephemeral=True)
 
-    view = NewsPaginationView(results, bot.ai, bot.db, interaction.user.id)
-    embed = await view.create_embed()
-    await interaction.followup.send(embed=embed, view=view)
+    embeds = []
+    for news in results:
+        # Check cache
+        summary_ai = await bot.db.get_processed_summary(news['id'])
+        if not summary_ai:
+            summary_ai = await bot.ai.process_with_ai(f"{news['title']}\n{news['summary_raw']}")
+            await bot.db.save_processed_summary(news['id'], summary_ai)
 
-@bot.tree.command(name="monitor", description="Monitora um termo e envia novidades via DM.")
-async def monitor(interaction: discord.Interaction, tema: str):
-    bot.db.add_monitor(interaction.user.id, tema)
-    await interaction.response.send_message(f"✅ Monitoramento ativado para: **{tema}**. Enviarei DMs quando encontrar novidades!", ephemeral=True)
+        embeds.append(bot.create_news_embed(news['title'], summary_ai, news['source'], news['link'], news['category']))
 
-@bot.command(name="check")
-async def check_command(ctx):
-    """Comando administrativo para forçar coleta."""
-    if ctx.author.guild_permissions.administrator:
-        await ctx.send("🔄 Iniciando coleta manual...")
-        await bot.process_collection()
-        await ctx.send("✅ Coleta finalizada!")
+    await interaction.followup.send(embeds=embeds[:5], ephemeral=True)
 
-# ==========================================
-# EVENTOS
-# ==========================================
-@bot.event
-async def on_ready():
-    LOGGER.info(f"Bot Online: {bot.user}")
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="/buscar"))
+@bot.tree.command(name="monitor", description="Adiciona um tópico para monitoramento.")
+@app_commands.describe(topic="Tópico de interesse")
+async def monitor(interaction: discord.Interaction, topic: str):
+    await bot.db.add_monitor(interaction.user.id, topic)
+    await interaction.response.send_message(f"Monitoramento ativado para: **{topic}**.", ephemeral=True)
 
 if __name__ == "__main__":
-    if DISCORD_TOKEN == "SEU_TOKEN_AQUI":
-        print("ERRO: Configure o DISCORD_TOKEN no topo do arquivo.")
+    if not DISCORD_TOKEN:
+        print("Error: DISCORD_TOKEN environment variable is not set.")
     else:
         bot.run(DISCORD_TOKEN)
