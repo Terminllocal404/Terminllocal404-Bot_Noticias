@@ -3,7 +3,7 @@ import logging
 import os
 import re
 from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any, Union
+from typing import List, Optional, Tuple, Dict, Any
 
 import discord
 import feedparser
@@ -14,15 +14,17 @@ from discord.ext import commands, tasks
 from openai import AsyncOpenAI
 
 # ==========================================
-# CONFIGURATION & LOGGING
+# CONFIGURAÇÃO DE LOGS
 # ==========================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-LOGGER = logging.getLogger("TechIntelBot")
+LOGGER = logging.getLogger("IntelTechBot")
 
-# Environment Variables
+# ==========================================
+# VARIÁVEIS DE AMBIENTE (REQUERIDAS)
+# ==========================================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MYSQL_HOST = os.getenv("MYSQL_HOST")
@@ -30,28 +32,24 @@ MYSQL_USER = os.getenv("MYSQL_USER")
 MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD")
 MYSQL_DATABASE = os.getenv("MYSQL_DATABASE")
 
-# ID dos canais para envios automáticos (críticos)
-# Podem ser configurados individualmente ou usar um padrão
-CHANNEL_ID_SECURITY = int(os.getenv("CHANNEL_ID_SECURITY", "0"))
-CHANNEL_ID_WINDOWS = int(os.getenv("CHANNEL_ID_WINDOWS", "0"))
-CHANNEL_ID_LINUX = int(os.getenv("CHANNEL_ID_LINUX", "0"))
-# Fallback para o canal geral se os outros não estiverem definidos
+# Canal para alertas automáticos (Destaques Críticos)
 AUTO_POST_CHANNEL_ID = int(os.getenv("AUTO_POST_CHANNEL_ID", "0"))
 
-# Sources
+# Fontes RSS
 RSS_SOURCES = {
     "The Hacker News": "https://thehackernews.com/feeds/posts/default",
     "BleepingComputer": "https://www.bleepingcomputer.com/feed/",
     "Reddit Linux": "https://www.reddit.com/r/linux/.rss",
     "Reddit Windows": "https://www.reddit.com/r/windows/.rss",
     "Reddit NetSec": "https://www.reddit.com/r/netsec/.rss",
-    "Reddit CyberSecurity": "https://www.reddit.com/r/cybersecurity/.rss"
+    "Reddit Cybersecurity": "https://www.reddit.com/r/cybersecurity/.rss"
 }
 
 # ==========================================
-# DATA LAYER (DATABASE)
+# CAMADA DE BANCO DE DADOS (MYSQL - AIOMYSQL)
 # ==========================================
 class DatabaseManager:
+    """Gerencia conexões, tabelas e persistência no MySQL de forma assíncrona."""
     def __init__(self):
         self.pool: Optional[aiomysql.Pool] = None
 
@@ -78,7 +76,7 @@ class DatabaseManager:
                             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                         )
                     """)
-                    # processed_news table
+                    # processed_news table (AI Summaries)
                     await cur.execute("""
                         CREATE TABLE IF NOT EXISTS processed_news (
                             id INT AUTO_INCREMENT PRIMARY KEY,
@@ -88,7 +86,7 @@ class DatabaseManager:
                             FOREIGN KEY (news_id) REFERENCES news(id) ON DELETE CASCADE
                         )
                     """)
-                    # search history table
+                    # user search history table
                     await cur.execute("""
                         CREATE TABLE IF NOT EXISTS user_search_history (
                             id INT AUTO_INCREMENT PRIMARY KEY,
@@ -97,37 +95,43 @@ class DatabaseManager:
                             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                         )
                     """)
-                    # user monitors
+                    # user monitors table
                     await cur.execute("""
                         CREATE TABLE IF NOT EXISTS user_monitors (
                             id INT AUTO_INCREMENT PRIMARY KEY,
                             user_id BIGINT NOT NULL,
                             topic VARCHAR(255) NOT NULL,
-                            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            UNIQUE(user_id, topic)
                         )
                     """)
-            LOGGER.info("MySQL Connection established and tables verified.")
+            LOGGER.info("MySQL Connection pool initialized and tables verified.")
         except Exception as e:
-            LOGGER.error(f"Critical Database Error: {e}")
+            LOGGER.error(f"Failed to initialize MySQL Database: {e}")
             raise
 
-    async def save_news(self, title: str, link: str, source: str, category: str, summary_raw: str) -> Optional[int]:
+    async def save_news(self, title: str, link: str, source: str, category: str, summary_raw: str) -> Tuple[Optional[int], bool]:
+        """Salva uma notícia e retorna seu ID e se ela foi inserida agora (True) ou já existia (False)."""
         try:
             async with self.pool.acquire() as conn:
                 async with conn.cursor() as cur:
+                    # Tenta inserir
                     await cur.execute(
                         "INSERT IGNORE INTO news (title, link, source, category, summary_raw) VALUES (%s, %s, %s, %s, %s)",
                         (title[:512], link, source, category, summary_raw)
                     )
-                    if cur.rowcount > 0:
-                        return cur.lastrowid
-                    # Se já existir, pegamos o ID existente
+                    was_inserted = cur.rowcount > 0
+
+                    if was_inserted:
+                        return cur.lastrowid, True
+
+                    # Se já existe, buscamos o ID
                     await cur.execute("SELECT id FROM news WHERE link = %s", (link,))
                     res = await cur.fetchone()
-                    return res[0] if res else None
+                    return (res[0], False) if res else (None, False)
         except Exception as e:
-            LOGGER.error(f"DB Error saving news: {e}")
-            return None
+            LOGGER.error(f"Error saving news to DB: {e}")
+            return None, False
 
     async def get_cached_summary(self, news_id: int) -> Optional[str]:
         try:
@@ -137,16 +141,16 @@ class DatabaseManager:
                     res = await cur.fetchone()
                     return res[0] if res else None
         except Exception as e:
-            LOGGER.error(f"DB Error getting cache: {e}")
+            LOGGER.error(f"Error getting cached summary: {e}")
             return None
 
-    async def save_cached_summary(self, news_id: int, summary: str):
+    async def save_processed_summary(self, news_id: int, summary: str):
         try:
             async with self.pool.acquire() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute("INSERT IGNORE INTO processed_news (news_id, summary) VALUES (%s, %s)", (news_id, summary))
         except Exception as e:
-            LOGGER.error(f"DB Error saving cache: {e}")
+            LOGGER.error(f"Error saving processed summary: {e}")
 
     async def search_news(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
         try:
@@ -158,10 +162,10 @@ class DatabaseManager:
                     )
                     return await cur.fetchall()
         except Exception as e:
-            LOGGER.error(f"DB Error searching: {e}")
+            LOGGER.error(f"Error searching news in DB: {e}")
             return []
 
-    async def get_by_category(self, category: str, limit: int = 5) -> List[Dict[str, Any]]:
+    async def get_latest_by_category(self, category: str, limit: int = 5) -> List[Dict[str, Any]]:
         try:
             async with self.pool.acquire() as conn:
                 async with conn.cursor(aiomysql.DictCursor) as cur:
@@ -171,44 +175,41 @@ class DatabaseManager:
                     )
                     return await cur.fetchall()
         except Exception as e:
-            LOGGER.error(f"DB Error fetching category: {e}")
+            LOGGER.error(f"Error getting news by category from DB: {e}")
             return []
 
-    async def log_search(self, user_id: int, query: str):
+    async def log_user_search(self, user_id: int, query: str):
         try:
             async with self.pool.acquire() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute("INSERT INTO user_search_history (user_id, query) VALUES (%s, %s)", (user_id, query))
         except Exception as e:
-            LOGGER.error(f"DB Error logging search: {e}")
+            LOGGER.error(f"Error logging search: {e}")
 
     async def add_monitor(self, user_id: int, topic: str):
         try:
             async with self.pool.acquire() as conn:
                 async with conn.cursor() as cur:
-                    await cur.execute("INSERT INTO user_monitors (user_id, topic) VALUES (%s, %s)", (user_id, topic))
+                    await cur.execute("INSERT IGNORE INTO user_monitors (user_id, topic) VALUES (%s, %s)", (user_id, topic))
         except Exception as e:
-            LOGGER.error(f"DB Error adding monitor: {e}")
+            LOGGER.error(f"Error adding monitor: {e}")
 
 # ==========================================
-# AI PROCESSING LAYER
+# CAMADA DE IA (OPENAI)
 # ==========================================
 class AIService:
+    """Utiliza a OpenAI para traduzir, resumir e destacar pontos-chave em Português."""
     def __init__(self, api_key: str):
         self.client = AsyncOpenAI(api_key=api_key)
 
     async def process_with_ai(self, text: str) -> str:
-        """
-        Calls OpenAI to translate to Portuguese, summarize, and highlight points.
-        Includes retry logic and timeout.
-        """
         if not OPENAI_API_KEY:
-            return "AI Error: API Key missing."
+            return "AI Error: Chave da OpenAI não configurada."
 
         prompt = (
-            "Você é um analista sênior de inteligência cibernética e tecnologia. "
-            "Traduza o seguinte conteúdo para o Português (Brasil), resuma-o de forma clara "
-            "e destaque os pontos principais com bullets. Utilize um tom profissional e informativo.\n\n"
+            "Você é um analista sênior em inteligência de ameaças e tecnologia. "
+            "Traduza o seguinte conteúdo para o Português (Brasil), resuma-o e destaque "
+            "os pontos mais importantes com bullets. Mantenha um tom profissional e informativo.\n\n"
             f"Texto: {text}"
         )
 
@@ -219,10 +220,10 @@ class AIService:
                     self.client.chat.completions.create(
                         model="gpt-4o-mini",
                         messages=[{"role": "user", "content": prompt}],
-                        max_tokens=700,
+                        max_tokens=600,
                         temperature=0.3
                     ),
-                    timeout=30.0
+                    timeout=25.0
                 )
                 return response.choices[0].message.content.strip()
             except Exception as e:
@@ -233,7 +234,7 @@ class AIService:
                 return f"Falha no processamento por IA: {str(e)}"
 
 # ==========================================
-# BOT LAYER
+# CAMADA DO BOT DO DISCORD
 # ==========================================
 class IntelBot(commands.Bot):
     def __init__(self):
@@ -249,7 +250,7 @@ class IntelBot(commands.Bot):
         await self.db.initialize()
         self.rss_sync_task.start()
         await self.tree.sync()
-        LOGGER.info("Bot logic and Slash commands synced.")
+        LOGGER.info("IntelBot setup complete. Commands synced.")
 
     async def close(self):
         if self.session:
@@ -259,99 +260,68 @@ class IntelBot(commands.Bot):
             await self.db.pool.wait_closed()
         await super().close()
 
-    def classify_news(self, text: str) -> str:
+    def classify_category(self, text: str) -> str:
         text = text.lower()
-        # Security Keywords (Priority 1)
-        security_kws = ["vulnerability", "exploit", "cve", "breach", "ransomware", "security", "zero-day", "hacking", "malware", "cyberattack", "ataque", "vulnerabilidade"]
+        security_kws = ["security", "vulnerability", "exploit", "cve", "breach", "ransomware", "hacking", "zero-day", "malware"]
         if any(kw in text for kw in security_kws):
             return "security"
-        # Windows (Priority 2)
-        if "windows" in text or "microsoft" in text or "azure" in text:
+        if "windows" in text or "microsoft" in text:
             return "windows"
-        # Linux (Priority 3)
-        if "linux" in text or "kernel" in text or "ubuntu" in text or "debian" in text or "fedora" in text:
+        if "linux" in text or "kernel" in text or "ubuntu" in text:
             return "linux"
         return "general"
 
-    def detect_critical(self, text: str) -> bool:
+    def is_critical(self, text: str) -> bool:
         text = text.lower()
-        critical_kws = ["critical", "zero-day", "data breach", "ransomware", "crítico", "vazamento"]
-        if any(kw in text for kw in critical_kws):
-            return True
-        # CVSS check (CVSS 9.0+)
-        cvss_match = re.search(r"cvss\s*(?:score)?\s*:?\s*([0-9.]+)", text)
-        if cvss_match:
-            try:
-                score = float(cvss_match.group(1))
-                if score >= 9.0:
-                    return True
-            except ValueError:
-                pass
-        return False
+        critical_kws = ["critical", "zero-day", "ransomware", "data breach", "vulnerabilidade crítica", "vazamento"]
+        return any(kw in text for kw in critical_kws)
 
-    async def process_rss_sync(self):
-        """Perform the actual RSS synchronization."""
-        LOGGER.info("Initiating RSS Sync...")
-        new_news_count = 0
+    @tasks.loop(minutes=30)
+    async def rss_sync_task(self):
+        LOGGER.info("Starting background RSS Ingestion...")
         for source_name, url in RSS_SOURCES.items():
             try:
                 async with self.session.get(url, timeout=20) as resp:
                     if resp.status != 200:
                         continue
                     content = await resp.text()
-                    # Use asyncio.to_thread for the blocking feedparser.parse call
                     feed = await asyncio.to_thread(feedparser.parse, content)
                     for entry in feed.entries:
                         title = entry.get("title", "No Title")
                         link = entry.get("link", "")
                         summary_raw = entry.get("summary", "") or entry.get("description", "")
 
-                        category = self.classify_news(f"{title} {summary_raw}")
+                        category = self.classify_category(f"{title} {summary_raw}")
 
-                        news_id = await self.db.save_news(title, link, source_name, category, summary_raw)
+                        news_id, is_new = await self.db.save_news(title, link, source_name, category, summary_raw)
 
-                        # Auto-send logic (Critical Alerts)
-                        if news_id and self.detect_critical(f"{title} {summary_raw}"):
-                            new_news_count += 1
-                            await self.handle_auto_post(news_id, title, summary_raw, source_name, link, category)
+                        # Alertas Automáticos (Destaques Críticos) - Apenas para notícias NOVAS
+                        if is_new and news_id and self.is_critical(f"{title} {summary_raw}"):
+                            await self.handle_auto_alert(news_id, title, summary_raw, source_name, link, category)
             except Exception as e:
                 LOGGER.error(f"Sync error for {source_name}: {e}")
-        return new_news_count
 
-    @tasks.loop(minutes=30)
-    async def rss_sync_task(self):
-        await self.process_rss_sync()
-
-    async def handle_auto_post(self, news_id, title, summary_raw, source, link, category):
-        # Determine the target channel based on category
-        channel_id = AUTO_POST_CHANNEL_ID
-        if category == "security" and CHANNEL_ID_SECURITY:
-            channel_id = CHANNEL_ID_SECURITY
-        elif category == "windows" and CHANNEL_ID_WINDOWS:
-            channel_id = CHANNEL_ID_WINDOWS
-        elif category == "linux" and CHANNEL_ID_LINUX:
-            channel_id = CHANNEL_ID_LINUX
-
-        if not channel_id:
+    async def handle_auto_alert(self, news_id, title, summary_raw, source, link, category):
+        if not AUTO_POST_CHANNEL_ID:
             return
 
-        channel = self.get_channel(channel_id)
+        channel = self.get_channel(AUTO_POST_CHANNEL_ID)
         if not channel:
             return
 
-        # Use cache if available
+        # Check cache (Don't reprocess AI)
         summary_ai = await self.db.get_cached_summary(news_id)
         if not summary_ai:
             summary_ai = await self.ai.process_with_ai(f"{title}\n{summary_raw}")
-            await self.db.save_cached_summary(news_id, summary_ai)
+            await self.db.save_processed_summary(news_id, summary_ai)
 
-        embed = self.create_intel_embed(title, summary_ai, source, link, category)
+        embed = self.create_news_embed(title, summary_ai, source, link, category)
         try:
             await channel.send(content="🚨 **ALERTA CRÍTICO DETECTADO**", embed=embed)
         except Exception as e:
-            LOGGER.error(f"Error sending auto post to channel {channel_id}: {e}")
+            LOGGER.error(f"Error sending auto alert: {e}")
 
-    def create_intel_embed(self, title, summary, source, link, category) -> discord.Embed:
+    def create_news_embed(self, title: str, summary: str, source: str, link: str, category: str) -> discord.Embed:
         colors = {
             "security": discord.Color.red(),
             "windows": discord.Color.blue(),
@@ -372,22 +342,14 @@ class IntelBot(commands.Bot):
 bot = IntelBot()
 
 # ==========================================
-# COMMANDS & SLASH COMMANDS
+# SLASH COMMANDS (EPHEMERAL)
 # ==========================================
 
-@bot.command(name="check")
-@commands.has_permissions(administrator=True)
-async def check_command(ctx):
-    """Force an immediate RSS update (Manual Update)."""
-    await ctx.send("🔄 Iniciando atualização manual das notícias... Aguarde.")
-    count = await bot.process_rss_sync()
-    await ctx.send(f"✅ Atualização concluída! {count} alertas críticos processados.")
-
-@bot.tree.command(name="buscar", description="Busca notícias relevantes e gera resumo via IA.")
-@app_commands.describe(query="Termo para pesquisa")
+@bot.tree.command(name="buscar", description="Pesquisa notícias relevantes no banco de dados e gera resumo com IA.")
+@app_commands.describe(query="Termo de busca")
 async def buscar(interaction: discord.Interaction, query: str):
     await interaction.response.defer(ephemeral=True)
-    await bot.db.log_search(interaction.user.id, query)
+    await bot.db.log_user_search(interaction.user.id, query)
 
     results = await bot.db.search_news(query, limit=5)
     if not results:
@@ -395,16 +357,17 @@ async def buscar(interaction: discord.Interaction, query: str):
 
     embeds = []
     for news in results:
+        # Check cache
         summary_ai = await bot.db.get_cached_summary(news['id'])
         if not summary_ai:
             summary_ai = await bot.ai.process_with_ai(f"{news['title']}\n{news['summary_raw']}")
-            await bot.db.save_cached_summary(news['id'], summary_ai)
+            await bot.db.save_processed_summary(news['id'], summary_ai)
 
-        embeds.append(bot.create_intel_embed(news['title'], summary_ai, news['source'], news['link'], news['category']))
+        embeds.append(bot.create_news_embed(news['title'], summary_ai, news['source'], news['link'], news['category']))
 
     await interaction.followup.send(embeds=embeds[:5], ephemeral=True)
 
-@bot.tree.command(name="categoria", description="Exibe as 5 últimas notícias de uma categoria específica.")
+@bot.tree.command(name="categoria", description="Exibe as últimas notícias armazenadas de uma categoria específica.")
 @app_commands.choices(categoria=[
     app_commands.Choice(name="Segurança", value="security"),
     app_commands.Choice(name="Windows", value="windows"),
@@ -413,32 +376,33 @@ async def buscar(interaction: discord.Interaction, query: str):
 async def categoria(interaction: discord.Interaction, categoria: app_commands.Choice[str]):
     await interaction.response.defer(ephemeral=True)
 
-    results = await bot.db.get_by_category(categoria.value, limit=5)
+    results = await bot.db.get_latest_by_category(categoria.value, limit=5)
     if not results:
-        return await interaction.followup.send(f"Sem notícias recentes para a categoria {categoria.name}.", ephemeral=True)
+        return await interaction.followup.send(f"Nenhuma notícia encontrada para a categoria {categoria.name}.", ephemeral=True)
 
     embeds = []
     for news in results:
+        # Check cache
         summary_ai = await bot.db.get_cached_summary(news['id'])
         if not summary_ai:
             summary_ai = await bot.ai.process_with_ai(f"{news['title']}\n{news['summary_raw']}")
-            await bot.db.save_cached_summary(news['id'], summary_ai)
+            await bot.db.save_processed_summary(news['id'], summary_ai)
 
-        embeds.append(bot.create_intel_embed(news['title'], summary_ai, news['source'], news['link'], news['category']))
+        embeds.append(bot.create_news_embed(news['title'], summary_ai, news['source'], news['link'], news['category']))
 
     await interaction.followup.send(embeds=embeds[:5], ephemeral=True)
 
-@bot.tree.command(name="monitor", description="Salva um tópico de interesse para monitoramento.")
-@app_commands.describe(topico="Tópico de interesse")
+@bot.tree.command(name="monitor", description="Adiciona um tópico para monitoramento automático futuro.")
+@app_commands.describe(topico="Tópico de interesse (ex: Linux, exploit)")
 async def monitor(interaction: discord.Interaction, topico: str):
     await bot.db.add_monitor(interaction.user.id, topico)
-    await interaction.response.send_message(f"✅ Monitoramento registrado para: **{topico}**", ephemeral=True)
+    await interaction.response.send_message(f"Monitoramento registrado para o tópico: **{topico}**.", ephemeral=True)
 
 # ==========================================
-# MAIN
+# INICIALIZAÇÃO
 # ==========================================
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
-        print("Error: DISCORD_TOKEN environment variable is not set.")
+        print("ERRO: DISCORD_TOKEN não configurado nas variáveis de ambiente.")
     else:
         bot.run(DISCORD_TOKEN)
